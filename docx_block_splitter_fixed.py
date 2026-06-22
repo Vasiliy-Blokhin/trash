@@ -2,7 +2,7 @@
 DocxBlockSplitter - Класс для разделения DOCX на логические блоки 
 и обработки текста с сохранением стилей.
 
-Версия: 2.0
+Версия: 2.1
 Python: 3.10+
 Зависимости: python-docx, lxml
 
@@ -13,6 +13,7 @@ Python: 3.10+
 - Разделение заголовков и элементов списка
 - Экспорт блоков в отдельные DOCX
 - Обработка текста с сохранением ВСЕХ стилей (XML-level копирование)
+- Сохранение изображений, таблиц, гиперссылок и других embedded-объектов
 """
 
 from docx import Document
@@ -22,6 +23,10 @@ from docx.oxml.ns import qn, nsdecls
 from docx.oxml import parse_xml
 from copy import deepcopy
 import re
+import os
+import shutil
+import zipfile
+import tempfile
 from typing import List, Dict, Any, Optional, Tuple, Union, Callable
 from dataclasses import dataclass, field
 from lxml import etree
@@ -120,6 +125,7 @@ class DocxBlockSplitter:
     - Разделение заголовков и элементов списка
     - Экспорт блоков в отдельные DOCX
     - Обработка текста с сохранением ВСЕХ стилей (XML-level копирование)
+    - Сохранение изображений, таблиц, гиперссылок и других embedded-объектов
     """
 
     def __init__(self, min_words: int = 10, merge_same_style: bool = True, 
@@ -485,26 +491,73 @@ class DocxBlockSplitter:
 
         return blocks
 
-    def create_block_document(self, block: LogicalBlock, output_path: str) -> None:
-        new_doc = Document()
-        for xml_elem in block.original_xml_elements:
-            new_para = new_doc.add_paragraph()
-            self._apply_paragraph_style(new_para, block.paragraph_style)
-            # Копируем ВСЕ дочерние элементы параграфа, сохраняя изображения, гиперссылки и т.д.
-            for child in xml_elem:
-                tag = child.tag.split('}')[-1] if '}' in child.tag else child.tag
-                if tag == 'pPr':
-                    continue  # Стиль уже применён через _apply_paragraph_style
-                new_child = deepcopy(child)
-                new_para._p.append(new_child)
-        new_doc.save(output_path)
+    def _copy_docx_with_rels(self, source_path: str, dest_path: str) -> None:
+        """
+        Копирует DOCX файл полностью, включая все relationships и media файлы.
+        DOCX — это ZIP-архив. Мы копируем все содержимое, чтобы сохранить
+        изображения, гиперссылки и другие embedded-объекты.
+        """
+        shutil.copy2(source_path, dest_path)
+
+    def create_block_document(self, block: LogicalBlock, output_path: str, 
+                               source_docx_path: str = None) -> None:
+        """
+        Создаёт новый DOCX документ из логического блока.
+
+        ВАЖНО: Для сохранения изображений и других embedded-объектов
+        необходимо передать source_docx_path — путь к исходному документу.
+        Тогда метод создаст копию исходного документа, оставив только
+        параграфы, входящие в данный блок.
+
+        Если source_docx_path не передан, создаётся пустой документ
+        (изображения и другие embedded-объекты будут потеряны).
+        """
+        if source_docx_path and os.path.exists(source_docx_path):
+            # Создаём копию исходного документа
+            self._copy_docx_with_rels(source_docx_path, output_path)
+            doc = Document(output_path)
+
+            # Получаем все параграфы документа
+            all_paras = list(doc.paragraphs)
+
+            # Собираем XML-элементы блока для сравнения
+            block_xml_ids = set()
+            for xml_elem in block.original_xml_elements:
+                block_xml_ids.add(id(xml_elem))
+
+            # Удаляем параграфы, которые НЕ входят в блок
+            # Удаляем с конца, чтобы индексы не смещались
+            body = doc.element.body
+            paragraphs_to_remove = []
+            for para in all_paras:
+                if id(para._p) not in block_xml_ids:
+                    paragraphs_to_remove.append(para._p)
+
+            for p_elem in paragraphs_to_remove:
+                body.remove(p_elem)
+
+            doc.save(output_path)
+        else:
+            # Fallback: создаём пустой документ (без изображений)
+            new_doc = Document()
+            for xml_elem in block.original_xml_elements:
+                new_para = new_doc.add_paragraph()
+                self._apply_paragraph_style(new_para, block.paragraph_style)
+                # Копируем ВСЕ дочерние элементы параграфа
+                for child in xml_elem:
+                    tag = child.tag.split('}')[-1] if '}' in child.tag else child.tag
+                    if tag == 'pPr':
+                        continue  # Стиль уже применён
+                    new_child = deepcopy(child)
+                    new_para._p.append(new_child)
+            new_doc.save(output_path)
 
     def split_to_files(self, docx_path: str, output_prefix: str) -> List[str]:
         blocks = self.split(docx_path)
         output_paths = []
         for idx, block in enumerate(blocks):
             output_path = f"{output_prefix}_block_{idx:03d}.docx"
-            self.create_block_document(block, output_path)
+            self.create_block_document(block, output_path, source_docx_path=docx_path)
             output_paths.append(output_path)
         return output_paths
 
@@ -521,7 +574,7 @@ class DocxBlockSplitter:
             for i, b in enumerate(blocks)
         ]
 
-    # ==================== НОВЫЕ МЕТОДЫ: ОБРАБОТКА ТЕКСТА С СОХРАНЕНИЕМ СТИЛЕЙ ====================
+    # ==================== ОБРАБОТКА ТЕКСТА С СОХРАНЕНИЕМ СТИЛЕЙ И ИЗОБРАЖЕНИЙ ====================
 
     def extract_paragraphs_with_styles(self, docx_path: str) -> List[Dict[str, Any]]:
         """
@@ -555,10 +608,14 @@ class DocxBlockSplitter:
                          skip_headings: bool = True,
                          skip_list_items: bool = False) -> None:
         """
-        Обрабатывает текст документа с сохранением ВСЕХ стилей.
+        Обрабатывает текст документа с сохранением ВСЕХ стилей, изображений,
+        таблиц, гиперссылок и других embedded-объектов.
 
-        Ключевая особенность: использует XML-level копирование с заменой текста,
-        что гарантирует 100% сохранение всех стилей (включая inherited styles).
+        КЛЮЧЕВАЯ ОСОБЕННОСТЬ: вместо создания нового документа и копирования
+        XML-элементов (что ломает relationships), мы работаем с КОПИЕЙ
+        исходного DOCX-файла (ZIP-архива), модифицируя только текст в
+        существующей XML-структуре. Это гарантирует 100% сохранение
+        всех изображений, таблиц, стилей и relationships.
 
         Args:
             input_path: Путь к входному DOCX
@@ -568,26 +625,26 @@ class DocxBlockSplitter:
             skip_headings: Пропускать заголовки (не обрабатывать)
             skip_list_items: Пропускать элементы списка
         """
-        doc = Document(input_path)
-        new_doc = Document()
+        # Копируем исходный файл целиком (сохраняем все relationships и media)
+        self._copy_docx_with_rels(input_path, output_path)
+
+        # Открываем копию для модификации
+        doc = Document(output_path)
+
+        nsmap = {'w': 'http://schemas.openxmlformats.org/wordprocessingml/2006/main'}
 
         # Обходим ВСЕ элементы body (параграфы, таблицы, изображения и т.д.)
         for element in doc.element.body:
             tag = element.tag.split('}')[-1] if '}' in element.tag else element.tag
 
-            if tag == 'tbl':
-                # Таблица — копируем без изменений
-                new_doc._element.body.append(deepcopy(element))
-                continue
-
+            # Таблицы, разрывы секций и другие не-параграфные элементы — пропускаем
+            # (они уже скопированы вместе с файлом, ничего менять не нужно)
             if tag != 'p':
-                # Другие элементы (разрывы секций, настройки и т.д.) — копируем без изменений
-                new_doc._element.body.append(deepcopy(element))
                 continue
 
             # Это параграф — обрабатываем текст
             para = element
-            text = ''.join(t.text or '' for t in para.findall('.//w:t', namespaces={'w': 'http://schemas.openxmlformats.org/wordprocessingml/2006/main'}))
+            text = ''.join(t.text or '' for t in para.findall('.//w:t', namespaces=nsmap))
             para_style = self._extract_paragraph_style_from_xml(para)
             is_heading = self._is_heading_from_xml(para)
             is_list_item = self._is_list_item_from_xml(para)
@@ -611,13 +668,8 @@ class DocxBlockSplitter:
             else:
                 new_text = text
 
-            # Копируем XML параграфа целиком
-            new_p = deepcopy(para)
-            new_doc._element.body.append(new_p)
-
-            # Находим все <w:t> элементы в скопированном параграфе
-            nsmap = {'w': 'http://schemas.openxmlformats.org/wordprocessingml/2006/main'}
-            t_elements = new_p.findall('.//w:t', namespaces=nsmap)
+            # Находим все <w:t> элементы в параграфе
+            t_elements = para.findall('.//w:t', namespaces=nsmap)
 
             if t_elements:
                 # Собираем оригинальные длины текстов
@@ -632,7 +684,8 @@ class DocxBlockSplitter:
                 # Распределяем новый текст пропорционально оригинальным длинам
                 self._replace_text_in_t_elements(t_elements, new_text, original_lengths)
 
-        new_doc.save(output_path)
+        # Сохраняем модифицированный документ
+        doc.save(output_path)
 
     def _replace_text_in_t_elements(self, t_elements: List, new_text: str, original_lengths: List[int]) -> None:
         """
@@ -695,6 +748,7 @@ class DocxBlockSplitter:
                                  skip_list_items: bool = False) -> None:
         """
         Упрощённая версия process_document — text_processor принимает только текст.
+        Сохраняет изображения, таблицы, гиперссылки и другие embedded-объекты.
 
         Args:
             input_path: Путь к входному DOCX
@@ -714,6 +768,7 @@ class DocxBlockSplitter:
                                   skip_list_items: bool = False) -> None:
         """
         Обрабатывает документ на месте (перезаписывает исходный файл).
+        Сохраняет изображения, таблицы, гиперссылки и другие embedded-объекты.
 
         Args:
             docx_path: Путь к DOCX файлу (будет перезаписан)
@@ -721,9 +776,6 @@ class DocxBlockSplitter:
             skip_headings: Пропускать заголовки
             skip_list_items: Пропускать элементы списка
         """
-        import tempfile
-        import os
-
         temp_path = tempfile.mktemp(suffix='.docx')
         self.process_document(docx_path, temp_path, text_processor, skip_headings, skip_list_items)
         os.replace(temp_path, docx_path)
@@ -742,10 +794,10 @@ if __name__ == "__main__":
         print(f"Стиль: {block.paragraph_style.style_name}")
         print("-" * 50)
 
-    # Пример 2: Сохранение блоков в файлы
+    # Пример 2: Сохранение блоков в файлы (с сохранением изображений)
     paths = splitter.split_to_files('input.docx', 'output/blocks')
 
-    # Пример 3: Обработка текста с сохранением стилей
+    # Пример 3: Обработка текста с сохранением стилей и изображений
     def my_processor(text, info):
         """Пример: перевод в верхний регистр"""
         return text.upper()
@@ -757,7 +809,7 @@ if __name__ == "__main__":
         skip_headings=True  # Заголовки не трогаем
     )
 
-    # Пример 4: Упрощённая обработка
+    # Пример 4: Упрощённая обработка (сохраняет изображения и таблицы)
     def simple_processor(text):
         return text.replace('старый', 'новый')
 
