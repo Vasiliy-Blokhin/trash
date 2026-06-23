@@ -1,8 +1,9 @@
+
 """
 DocxBlockSplitter - Класс для разделения DOCX на логические блоки 
 и обработки текста с сохранением стилей.
 
-Версия: 2.1
+Версия: 2.2 (исправленная)
 Python: 3.10+
 Зависимости: python-docx, lxml
 
@@ -499,6 +500,36 @@ class DocxBlockSplitter:
         """
         shutil.copy2(source_path, dest_path)
 
+    def _get_xml_signature(self, p_elem) -> str:
+        """
+        Создаёт уникальную сигнатуру XML-элемента параграфа для сопоставления.
+        Используется для идентификации параграфа между копиями документа.
+        """
+        # Собираем текстовое содержимое и ключевые атрибуты стиля
+        texts = []
+        for t in p_elem.findall('.//w:t', namespaces={'w': 'http://schemas.openxmlformats.org/wordprocessingml/2006/main'}):
+            if t.text:
+                texts.append(t.text)
+
+        # Получаем стиль параграфа
+        pPr = p_elem.find(qn('w:pPr'))
+        style_info = []
+        if pPr is not None:
+            pStyle = pPr.find(qn('w:pStyle'))
+            if pStyle is not None:
+                style_info.append(pStyle.get(qn('w:val'), ''))
+
+            # Добавляем информацию об отступах
+            ind = pPr.find(qn('w:ind'))
+            if ind is not None:
+                style_info.append(f"left={ind.get(qn('w:left'), '0')}")
+                style_info.append(f"first={ind.get(qn('w:firstLine'), '0')}")
+
+        # Создаём сигнатуру: первые 100 символов текста + стиль + позиция
+        text_preview = ''.join(texts)[:100]
+        sig = f"{text_preview}|{'|'.join(style_info)}"
+        return sig
+
     def create_block_document(self, block: LogicalBlock, output_path: str, 
                                source_docx_path: str = None) -> None:
         """
@@ -517,24 +548,54 @@ class DocxBlockSplitter:
             self._copy_docx_with_rels(source_docx_path, output_path)
             doc = Document(output_path)
 
-            # Получаем все параграфы документа
-            all_paras = list(doc.paragraphs)
-
-            # Собираем XML-элементы блока для сравнения
-            block_xml_ids = set()
+            # Создаём сигнатуры для параграфов блока из оригинала
+            block_sigs = set()
             for xml_elem in block.original_xml_elements:
-                block_xml_ids.add(id(xml_elem))
+                block_sigs.add(self._get_xml_signature(xml_elem))
 
-            # Удаляем параграфы, которые НЕ входят в блок
-            # Удаляем с конца, чтобы индексы не смещались
+            # Получаем все элементы body (параграфы, таблицы и т.д.)
             body = doc.element.body
-            paragraphs_to_remove = []
-            for para in all_paras:
-                if id(para._p) not in block_xml_ids:
-                    paragraphs_to_remove.append(para._p)
+            elements_to_remove = []
 
-            for p_elem in paragraphs_to_remove:
-                body.remove(p_elem)
+            for element in body:
+                tag = element.tag.split('}')[-1] if '}' in element.tag else element.tag
+
+                if tag == 'p':
+                    # Это параграф — проверяем, входит ли он в блок
+                    sig = self._get_xml_signature(element)
+                    if sig not in block_sigs:
+                        elements_to_remove.append(element)
+                elif tag == 'tbl':
+                    # Таблица — проверяем, содержит ли она параграфы из блока
+                    # Если таблица не содержит ни одного параграфа блока — удаляем
+                    tbl_texts = []
+                    for t in element.findall('.//w:t', namespaces={'w': 'http://schemas.openxmlformats.org/wordprocessingml/2006/main'}):
+                        if t.text:
+                            tbl_texts.append(t.text)
+                    tbl_text = ''.join(tbl_texts)[:100]
+
+                    # Проверяем, есть ли текст таблицы в блоке
+                    found_in_block = False
+                    for block_xml in block.original_xml_elements:
+                        block_texts = []
+                        for t in block_xml.findall('.//w:t', namespaces={'w': 'http://schemas.openxmlformats.org/wordprocessingml/2006/main'}):
+                            if t.text:
+                                block_texts.append(t.text)
+                        block_text = ''.join(block_texts)[:100]
+                        if block_text and block_text in tbl_text or tbl_text in block_text:
+                            found_in_block = True
+                            break
+
+                    if not found_in_block:
+                        elements_to_remove.append(element)
+                else:
+                    # Другие элементы (разрывы секций и т.д.) — удаляем, если не в блоке
+                    # Для секций проверяем по контексту
+                    elements_to_remove.append(element)
+
+            # Удаляем элементы
+            for elem in elements_to_remove:
+                body.remove(elem)
 
             doc.save(output_path)
         else:
